@@ -1,0 +1,10 @@
+checkpoints/grid/stage1_iter_40.pt
+checkpoints/grid/stage1_iter_41.pt
+checkpoints/grid/stage1_iter_42.pt
+checkpoints/grid/stage1_iter_43.pt
+checkpoints/grid/stage1_iter_44.pt
+checkpoints/grid/stage1_iter_45.pt
+checkpoints/grid/stage1_iter_46.pt
+checkpoints/grid/stage1_iter_47.pt
+checkpoints/grid/stage1_iter_48.pt
+checkpoints/grid/stage1_iter_49.pt

@@ -15,5 +15,5 @@
 ### Training
 > python grpo_trainer.py 0 grid
 
-<!-- 插入训练结果图片 -->
-<img src="./imgs/grpo.jpg" width="300" height="300">
+
+<img src="./imgs/grpo.jpg" width="450" height="400" alt="grpo loss">

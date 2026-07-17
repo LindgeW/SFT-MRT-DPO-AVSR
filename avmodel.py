@@ -6,7 +6,10 @@ from multiprocessing import Pool
 from conformer import Conformer
 from transformer2 import TransformerEncoder
 import random
-from batch_beam_search import beam_decode
+#from batch_beam_search import beam_decode
+
+#from batch_beam_search_better import beam_decode
+from batch_beam_search_better2 import beam_decode, beam_decode_diverse
 
 
 def conv3x3(in_planes, out_planes, stride=1):
@@ -282,6 +285,14 @@ class AVSRModel(nn.Module):
         out = self.ln(av + av_mlp(av))
         return out
 
+    def frozen_encoder(self):
+        self.frontend3D.requires_grad_(False)
+        self.resnet18.requires_grad_(False)
+        self.afront.requires_grad_(False)
+        self.cfm_a.requires_grad_(False)
+        self.cfm_v.requires_grad_(False)
+        #self.cfm_c.requires_grad_(False)
+
     def forward(self, vid, aud, tgt, vid_lens=None, aud_lens=None, tgt_lens=None):  # (b, t, c, h, w)
         enc_src, src_lens = self.encode_av(vid, aud, vid_lens, aud_lens)
         ctc_log_probs = self.ctc_fc(enc_src).log_softmax(dim=-1).transpose(0, 1)  # (T, B, V)
@@ -316,9 +327,11 @@ class AVSRModel(nn.Module):
         dec_logits = self.trans_dec(tgt, enc_memory, src_lens=src_lens, tgt_lens=tgt_lens)
         return dec_logits.log_softmax(dim=-1)
     
+    @torch.no_grad()
     def generate(self, enc_memory, src_lens, bos_id, eos_id, max_dec_len=100, beam_size=5):
         # 返回: N-best tokens List[List[Tensor]]
-        res = beam_decode(self.trans_dec, enc_memory, src_lens, bos_id, eos_id, max_output_length=max_dec_len, beam_size=beam_size, n_best=beam_size)[0]
+        #res = beam_decode(self.trans_dec, enc_memory, src_lens, bos_id, eos_id, max_output_length=max_dec_len, beam_size=beam_size, n_best=beam_size)[0]
+        res = beam_decode_diverse(self.trans_dec, enc_memory, src_lens, bos_id, eos_id, max_output_length=max_dec_len, beam_size=beam_size, n_best=beam_size)[0]
         return res
     
     @torch.no_grad()
@@ -330,7 +343,9 @@ class AVSRModel(nn.Module):
         #enc_src = self.av_trans(enc_a.transpose(0, 1), enc_v.transpose(0, 1), enc_v.transpose(0, 1)).transpose(0, 1)
         #enc_src = self.av_trans(enc_vc.transpose(0, 1), enc_ac.transpose(0, 1), enc_ac.transpose(0, 1)).transpose(0, 1)
         #res = beam_decode(self.trans_dec, enc_src, src_mask, bos_id, eos_id, max_output_length=max_dec_len, beam_size=10)
+        
         res = beam_decode(self.trans_dec, enc_src, src_lens, bos_id, eos_id, max_output_length=max_dec_len, beam_size=10).detach().cpu()
+        #res = beam_decode_diverse(self.trans_dec, enc_src, src_lens, bos_id, eos_id, max_output_length=max_dec_len, beam_size=10).detach().cpu()
         return res
 
     def ctc_greedy_decode(self, vids, lens=None):
@@ -340,17 +355,6 @@ class AVSRModel(nn.Module):
             logits = self.fc(seq_feat)  # (B, T, V)
             return logits.data.cpu().argmax(dim=-1)
 
-    def ctc_beam_decode(self, vids, lens=None):
-        res = []
-        with torch.no_grad():
-            vid_feat = self.visual_frontend(vids)
-            seq_feat = self.cfm(vid_feat, lens)
-            logits = self.fc(seq_feat)  # (B, T, V)
-            probs = torch.log_softmax(logits, dim=-1).cpu().numpy()
-            for prob in probs:
-                pred = ctc_beam_decode3(prob, 10, 0)
-                res.append(pred)
-            return res
     
     '''
     def beam_decode(self, vids):
@@ -425,3 +429,6 @@ class Transpose(nn.Module):
 
     def forward(self, x):
         return torch.transpose(x, self.dim0, self.dim1)
+
+
+

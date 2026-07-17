@@ -275,8 +275,8 @@ class NoiseDataset(object):
         
         #self.snrs = list(range(-10, 25, 5))   # -10 to 20
         #self.snrs = list(range(-5, 25, 5))   # -5 to 20
-        #self.snrs = np.arange(-12.5, 20, 5.).tolist()   # -12.5 to 17.5  best choice
         self.snrs = np.arange(-7.5, 20, 5.).tolist()   # -7.5 to 17.5  best choice
+        #self.snrs = np.arange(-12.5, 20, 5.).tolist()   # -12.5 to 17.5  best choice
         print('SNR Range:', self.snrs)
 
     def testing_noisy_signal(self, signal, snr_db=None):
@@ -297,11 +297,12 @@ class NoiseDataset(object):
     def training_noisy_signal(self, signal, snr_range=None, p=0.25):
         if p <= 0:
             snr_db = random.choice((self.snrs if snr_range is None else snr_range) + [None])
+            #snr_db = max(-10, int(np.random.normal(5, 5)))  
             if snr_db is None: return normalize(signal)
         else:
             if np.random.rand() >= p: return normalize(signal)
             snr_db = random.choice(self.snrs if snr_range is None else snr_range)  
-            #snr_db = round(np.random.normal(0, 5))   # -15 to 15
+            #snr_db = max(-10, int(np.random.normal(5, 5)))   
 
         if isinstance(self.noise, (list, tuple)):
             noise = random.choice(self.noise)
@@ -582,6 +583,7 @@ class GRIDDataset(Dataset):
         else:
             #noisy_aud = clean_aud
             noisy_aud = self.get_fbank(self.noise_generator['babble'].testing_noisy_signal(y, -5), sr) 
+            #noisy_aud = self.get_fbank(self.noise_generator['babble'].testing_noisy_signal(y, -10), sr) 
         return clean_aud, noisy_aud
 
     def get_fbank(self, y, sr=16000, norm=True):
@@ -763,6 +765,8 @@ class GRIDDataset(Dataset):
         pad_batch['aud_lens'] = torch.tensor(aud_lens)
         pad_batch['txt_lens'] = torch.tensor(txt_lens)
         return pad_batch
+
+
 
 
 

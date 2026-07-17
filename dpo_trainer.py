@@ -57,7 +57,7 @@ class BaseTrainer:
         self.model.train()
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
-        self.step = 0
+        self.current_step = 0
         self.accumulate_step = accumulate_step
     
     def train_step(self, vid_inp, aud_inp, targets, vid_lens, aud_lens, tgt_lens):
@@ -74,14 +74,14 @@ class BaseTrainer:
         #loss = self.model(clean_vid_inp, noisy_vid_inp, clean_aud_inp, noisy_aud_inp, targets, vid_lens, aud_lens, tgt_lens)
         loss = loss / self.accumulate_step
         loss.backward()
-        self.step += 1
-        if self.step % self.accumulate_step == 0:
+        self.current_step += 1
+        if self.current_step % self.accumulate_step == 0:
             #torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
             self.optimizer.zero_grad()
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step()
-            self.step = 0
+            self.current_step = 0
         return {"avsr_loss": loss.data.item()}
 
 
@@ -101,12 +101,13 @@ class MRT_DPO_Trainer:
         self.ref_model = copy.deepcopy(model)
         for param in self.ref_model.parameters():
             param.requires_grad = False
+        #self.ref_model.to(device)
         self.ref_model.eval()
         
         self.criterion = JointLoss(mrt_alpha=1.)
         self.weights = {'ce': lambda_ce, 'mrt': lambda_mrt, 'dpo': lambda_dpo}
 
-    def get_batch_log_probs(self, model, tgt_tokens, enc_memory, src_lens, tgt_lens):
+    def get_batch_log_probs(self, model, tgt_tokens, enc_memory, src_lens, tgt_lens, len_norm=False):
         """
             通用辅助函数：计算给定 Token 序列在模型下的 Log-Prob (Sum over sequence)
         """
@@ -135,10 +136,39 @@ class MRT_DPO_Trainer:
         
         # Sum log probs over sequence length
         seq_log_probs = (target_log_probs * pad_mask).sum(dim=-1)
-        
+
+        if len_norm:
+            seq_lens = pad_mask.sum(dim=-1).clamp(min=1)
+            return seq_log_probs / seq_lens
+       
         return seq_log_probs
 
-    def train_step(self, vid_inp, aud_inp, tgt_tokens, vid_lens, aud_lens, tgt_lens, n_best=5):
+    def type_aware_wer(self, ref_str, hyp_str, w_s=1.5, w_d=1., w_i=1.):
+        """
+        计算类型感知的加权 WER，作为 MRT 的 Risk 或 DPO 的负 Reward。
+        w_s: 替换错误 (Substitution) 的权重，AVSR 中建议调高，打击嘴型歧义猜词。
+        w_d: 删除错误 (Deletion) 的权重。
+        w_i: 插入错误 (Insertion) 的权重。
+        """
+        # 边界情况处理：如果两者都为空，风险为 0
+        if not ref_str.strip() and not hyp_str.strip():
+            return 0.0
+        # 边界情况处理：如果 ref 为空，hyp 不为空，全算作 Insertion
+        if not ref_str.strip():
+            return w_i * len(hyp_str.split())
+
+        # 使用 jiwer 直接获取精确的 S, D, I 统计
+        measures = jiwer.compute_measures(ref_str, hyp_str)
+
+        S = measures['substitutions']
+        D = measures['deletions']
+        I = measures['insertions']
+        N = measures['hits'] + S + D  # 严格等于真实文本的单词数
+
+        # 计算加权wer
+        return (w_s * S + w_d * D + w_i * I) / max(N, 1)
+
+    def train_step(self, vid_inp, aud_inp, tgt_tokens, vid_lens, aud_lens, tgt_lens, n_best=8):
         """
         vid_inp: [B, C, T, H, W]
         aud_inp: [B, T_a, D]
@@ -150,6 +180,7 @@ class MRT_DPO_Trainer:
         # Step 1: Encoder 前向 (只做一次)
         # -------------------------------------------
         # 联合编码 AV 特征
+        #enc_memory, mem_mask = self.model.encode_av(vid_inp, aud_inp)
         enc_memory, src_lens = self.model.encode_av(vid_inp, aud_inp, vid_lens, aud_lens)
 
         # -------------------------------------------
@@ -182,7 +213,8 @@ class MRT_DPO_Trainer:
                 for h in hyps:
                     # 计算 WER (Risk)
                     #wer = editdistance.eval(h['text'].split(), ref_text.split()) / (len(ref_text.split()) + 1e-8)
-                    wers.append(jiwer.wer(ref_text, h['text']))
+                    #wers.append(jiwer.wer(ref_text, h['text']))
+                    wers.append(self.type_aware_wer(ref_text, h['text'], 2, 1.5, 1))
                     current_batch_tokens.append(h['tokens'])
                 
                 # --- 构建 DPO 数据 ---
@@ -195,7 +227,9 @@ class MRT_DPO_Trainer:
                 else:
                     #worst_idx = wers.index(sorted(set(wers))[1])  # WER次低
                     #worst_idx = wers.index(random.choice(sorted(set(wers))[1:-1]))  # WER次低
-                    worst_idx = wers.index(random.choice(sorted(set(x for x in wers if x != 0))[:3]))
+                    #worst_idx = wers.index(random.choice(sorted(set(x for x in wers if x != 0))[:3]))  # WER次低
+                    worst_val = random.choice(sorted(set(x for x in wers if x != 0))[:4])
+                    worst_idx = random.choice([i for i, x in enumerate(wers) if x == worst_val])
                 dpo_rejected_tokens.append(hyps[worst_idx]['tokens'])
                 
                 # --- 构建 MRT 数据 ---
@@ -219,10 +253,12 @@ class MRT_DPO_Trainer:
         # A. 计算 MRT 需要的所有序列概率 (N-best + GT)
         # 扩展 enc_memory: [B, T, D] -> [B * (N+1), T, D]
         mrt_mem_expanded = enc_memory.repeat_interleave(n_best + 1, dim=0)
+        #mrt_mask_expanded = mem_mask.repeat_interleave(n_best + 1, dim=0)
         src_lens_expanded = src_lens.repeat_interleave(n_best + 1, dim=0)
         tgt_lens_expanded = tgt_lens.repeat_interleave(n_best + 1, dim=0)
         
         # 得到 [Batch * (N+1)]
+        #all_mrt_logps = self.get_batch_log_probs(self.model, mrt_inputs, mrt_mem_expanded, mrt_mask_expanded)
         all_mrt_logps = self.get_batch_log_probs(self.model, mrt_inputs, mrt_mem_expanded, src_lens_expanded, tgt_lens_expanded)
         # Reshape -> [Batch, N+1]
         all_mrt_logps_view = all_mrt_logps.view(batch_size, n_best + 1)
@@ -233,12 +269,16 @@ class MRT_DPO_Trainer:
         
         # Rejected 比较麻烦，它在 MRT 列表里的位置不固定
         # 为了代码简单，我们单独算一次 Rejected 的概率 (稍微多花点计算量，但逻辑清晰) 或者从 all_mrt_logps 中根据 worst_idx 提取
+        #policy_rejected_logps = self.get_batch_log_probs(self.model, dpo_rejected, enc_memory, mem_mask)
         policy_rejected_logps = self.get_batch_log_probs(self.model, dpo_rejected, enc_memory, src_lens, tgt_lens)
 
         # -------------------------------------------
         # Step 4: Reference Model 计算 Log-Probs (No Grad)
         # -------------------------------------------
         with torch.no_grad():
+            #ref_mem, ref_mask = self.ref_model.encode_av(vid_inp, aud_inp)
+            #ref_chosen_logps = self.get_batch_log_probs(self.ref_model, tgt_tokens, ref_mem, ref_mask)
+            #ref_rejected_logps = self.get_batch_log_probs(self.ref_model, dpo_rejected, ref_mem, ref_mask)
             ref_mem = self.ref_model.encode_av(vid_inp, aud_inp, vid_lens, aud_lens)[0]
             ref_chosen_logps = self.get_batch_log_probs(self.ref_model, tgt_tokens, ref_mem, src_lens, tgt_lens)
             ref_rejected_logps = self.get_batch_log_probs(self.ref_model, dpo_rejected, ref_mem, src_lens, tgt_lens)
@@ -267,7 +307,7 @@ class MRT_DPO_Trainer:
         
         total_loss.backward()
         
-        nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        #nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         
         self.optimizer.step()
 
@@ -312,8 +352,10 @@ def main():
     accumulate_step = 1
     epochs = {'I': 50, 'II': 5}   
     lrs = {'I': 3e-4, 'II': 1e-5}  # 1.61
+    #lrs = {'I': 3e-4, 'II': 5e-6}  # 1.61
     savedir = os.path.join('checkpoints', 'grid')
 
+    
     train_set.noise_ratio = 0.25
     data_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, collate_fn=train_set.collate_pad)  
     #optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -342,13 +384,13 @@ def main():
             save_path = os.path.join(savedir, savename)
             torch.save({'model': model.state_dict()}, save_path)
             print(f'Saved to {save_path}!!!', flush=True)
-
+    
 
     train_set.noise_ratio = 0.
     data_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, collate_fn=train_set.collate_pad)  
     optimizer2 = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lrs['II'], betas=(0.9, 0.98), eps=1e-9, weight_decay=1e-4)
     ## II MRT-DPO
-    mrt_dpo_trainer = MRT_DPO_Trainer(model, optimizer2, train_set.vocab, lambda_mrt=0.8, lambda_dpo=0.2, device=device)
+    mrt_dpo_trainer = MRT_DPO_Trainer(model, optimizer2, train_set.vocab, lambda_ce=0.2, lambda_mrt=0.9, lambda_dpo=0.1, device=device)
     for ep in range(epochs['II']):
         for i, batch_data in enumerate(data_loader):  # (B, T, C, H, W)
             #clean_vid_inp = batch_data['clean_vid'].to(device)
@@ -361,7 +403,7 @@ def main():
             tgt_lens = batch_data['txt_lens'].to(device)
             #print(batch_data['clean_vid_lens'], batch_data['noisy_vid_lens'], batch_data['clean_aud_lens'], batch_data['noisy_aud_lens'])
             loss_val = mrt_dpo_trainer.train_step(noisy_vid_inp, noisy_aud_inp, targets, vid_lens, aud_lens, tgt_lens)
-            print(f'Epoch {ep}, Iter {i}, lr: {optimizer2.param_groups[0]["lr"]}, loss: {loss_val["total"]}', flush=True)
+            print(f'Epoch {ep}, Iter {i}, lr: {optimizer2.param_groups[0]["lr"]}, mrt_loss: {loss_val["mrt"]}, dpo_loss: {loss_val["dpo"]}, ce_loss: {loss_val["ce"]}, total loss: {loss_val["total"]}', flush=True)
         if ep > 1:
             savename = 'stage2_iter_{}.pt'.format(ep)
             if not os.path.exists(savedir): os.makedirs(savedir)
@@ -450,6 +492,4 @@ def set_seed(seed=42):
 if __name__ == '__main__':
     set_seed(1337)
     main()
-    #evaluate()
-
-
+    # evaluate()

@@ -1150,6 +1150,6 @@ def set_seed(seed=42):
     
 if __name__ == '__main__':
     set_seed(1337)
-    #main()
-    evaluate()
+    main()
+    # evaluate()
 

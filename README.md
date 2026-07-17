@@ -10,3 +10,6 @@
 - [x] Direct Preference Optimization (DPO)
 - [x] Group Relative Policy Optimization (GRPO)
 
+
+### Training
+python grpo_trainer.py 0 grid
